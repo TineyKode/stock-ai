@@ -1,8 +1,13 @@
 name: Fetch US Stocks
+
 on:
   schedule:
     - cron: '0 18 * * *'  # 6 PM UTC (after market close)
   workflow_dispatch:  # Allow manual runs
+
+permissions:
+  contents: write
+  issues: write
 
 jobs:
   fetch:
