@@ -6,28 +6,28 @@ from sklearn.ensemble import RandomForestClassifier
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.features import TECHNICAL_FEATURES
+from utils.features import TECHNICAL_FEATURES, MODEL_PARAMS
+from utils.dataset import load_features, add_target
 from utils.evaluation import walk_forward_validate, save_metrics
 
-# Load features (sorted by Date from preprocessing)
-data = pd.read_csv("data/processed/features.csv")
-
-# Train on AAPL (primary ticker)
-data = data[data["Ticker"] == "AAPL"].copy()
+# Load features and build a next-day-up target per ticker.
+# Trained on ALL tickers pooled (not AAPL alone) so one model
+# generalizes across the tickers the dashboard serves.
+data = load_features()
+data = add_target(data)
+data = data.dropna(subset=TECHNICAL_FEATURES + ["Target"])
 data = data.sort_values("Date").reset_index(drop=True)
 
-# Create target: 1 if price rises next day, else 0
-data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
-data = data.dropna(subset=TECHNICAL_FEATURES + ["Target"])
-
 X = data[TECHNICAL_FEATURES]
-y = data["Target"]
+y = data["Target"].astype(int)
 
-print(f"Training data: {len(X)} samples, {len(TECHNICAL_FEATURES)} features")
+n_tickers = data["Ticker"].nunique() if "Ticker" in data.columns else 1
+print(f"Training data: {len(X)} samples across {n_tickers} tickers, "
+      f"{len(TECHNICAL_FEATURES)} features")
 print(f"Class balance: UP={int(y.sum())}/{len(y)} ({y.mean():.1%})")
 
-# Walk-forward cross-validation
-model_params = {"n_estimators": 100, "max_depth": 5, "random_state": 42}
+# Walk-forward cross-validation (shared hyperparameters)
+model_params = MODEL_PARAMS["technical"]
 cv_results = walk_forward_validate(
     RandomForestClassifier, model_params, X, y, n_splits=5
 )
@@ -60,6 +60,7 @@ for name, imp in importances:
     print(f"  {name:20s}: {imp:.4f}")
 
 # Save
+os.makedirs("models", exist_ok=True)
 save_metrics(cv_results, "technical")
 joblib.dump(final_model, "models/technical_model.pkl")
 print("\nTechnical model saved to models/technical_model.pkl")

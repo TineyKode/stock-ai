@@ -6,41 +6,28 @@ from sklearn.ensemble import RandomForestClassifier
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.features import HYBRID_FEATURES, TECHNICAL_FEATURES
+from utils.features import HYBRID_FEATURES, MODEL_PARAMS
+from utils.dataset import load_features, add_target, merge_sentiment
 from utils.evaluation import walk_forward_validate, save_metrics
 
-# Load technical features and sentiment
-tech_data = pd.read_csv("data/processed/features.csv")
-try:
-    sentiment = pd.read_csv("data/processed/news_sentiment.csv")
-    # Average sentiment per date+ticker (or just date if no Ticker column)
-    group_cols = ["Date", "Ticker"] if "Ticker" in sentiment.columns else ["Date"]
-    sentiment_daily = sentiment.groupby(group_cols, as_index=False)["sentiment_score"].mean()
-    # Merge on available keys
-    merge_cols = [c for c in group_cols if c in tech_data.columns]
-    merged = pd.merge(tech_data, sentiment_daily, on=merge_cols, how="left")
-except FileNotFoundError:
-    print("No sentiment data found — using neutral 0.5 for all rows")
-    merged = tech_data.copy()
+# Load features, merge sentiment (neutral 0.5 fill), build per-ticker target.
+# Trained on ALL tickers pooled (not AAPL alone).
+data = load_features()
+data = merge_sentiment(data)
+data = add_target(data)
+data = data.dropna(subset=HYBRID_FEATURES + ["Target"])
+data = data.sort_values("Date").reset_index(drop=True)
 
-merged["sentiment_score"] = merged["sentiment_score"].fillna(0.5) if "sentiment_score" in merged.columns else 0.5
+X = data[HYBRID_FEATURES]
+y = data["Target"].astype(int)
 
-# Train on AAPL
-merged = merged[merged["Ticker"] == "AAPL"].copy()
-merged = merged.sort_values("Date").reset_index(drop=True)
-
-# Create target: 1 if price rises next day, else 0
-merged["Target"] = (merged["Close"].shift(-1) > merged["Close"]).astype(int)
-merged = merged.dropna(subset=HYBRID_FEATURES + ["Target"])
-
-X = merged[HYBRID_FEATURES]
-y = merged["Target"]
-
-print(f"Training data: {len(X)} samples, {len(HYBRID_FEATURES)} features")
+n_tickers = data["Ticker"].nunique() if "Ticker" in data.columns else 1
+print(f"Training data: {len(X)} samples across {n_tickers} tickers, "
+      f"{len(HYBRID_FEATURES)} features")
 print(f"Class balance: UP={int(y.sum())}/{len(y)} ({y.mean():.1%})")
 
-# Walk-forward cross-validation
-model_params = {"n_estimators": 100, "random_state": 42}
+# Walk-forward cross-validation (shared hyperparameters)
+model_params = MODEL_PARAMS["hybrid"]
 cv_results = walk_forward_validate(
     RandomForestClassifier, model_params, X, y, n_splits=5
 )
@@ -63,6 +50,7 @@ if "mean_roc_auc" in agg:
 model = RandomForestClassifier(**model_params).fit(X, y)
 
 # Save
+os.makedirs("models", exist_ok=True)
 save_metrics(cv_results, "hybrid")
 joblib.dump(model, "models/hybrid_model.pkl")
 print(f"\nHybrid model trained on {len(X)} samples and saved.")

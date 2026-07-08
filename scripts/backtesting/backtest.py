@@ -15,7 +15,7 @@ import joblib
 from sklearn.model_selection import TimeSeriesSplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.features import TECHNICAL_FEATURES, HYBRID_FEATURES
+from utils.features import TECHNICAL_FEATURES, HYBRID_FEATURES, MODEL_PARAMS
 
 
 TRANSACTION_COST_BPS = 10  # 10 basis points per trade
@@ -200,9 +200,11 @@ def main():
         close = close.loc[valid]
 
         from sklearn.ensemble import RandomForestClassifier
-        # Use a fresh model for walk-forward (loaded model was trained on all data)
+        # Fresh model per fold, using the SAME hyperparameters that ship
+        # (utils.features.MODEL_PARAMS) so the backtest reflects the
+        # deployed model rather than an ad-hoc configuration.
         metrics, results = backtest_model(
-            RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42),
+            RandomForestClassifier(**MODEL_PARAMS["technical"]),
             X, close, feat_cols,
         )
         print_backtest_report(metrics, f"Technical Model ({ticker})")
@@ -239,7 +241,7 @@ def main():
 
     from sklearn.ensemble import RandomForestClassifier
     metrics_h, results_h = backtest_model(
-        RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42),
+        RandomForestClassifier(**MODEL_PARAMS["hybrid"]),
         X_h, close_h, feat_cols_h,
     )
     print_backtest_report(metrics_h, f"Hybrid Model ({ticker})")

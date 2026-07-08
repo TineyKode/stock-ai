@@ -37,8 +37,8 @@ Stock AI is an AI-powered stock price prediction system that combines historical
 **Core capabilities:**
 
 - **Data Pipeline** — US stocks via yfinance (5-year history), Kenyan stocks via CSV/Google Sheets, news via NewsAPI + BERTweet sentiment
-- **13 Technical Indicators** — RSI-14, SMA-50, OBV, MACD, Bollinger Bands, ATR-14, lagged returns, volatility, volume ratio
-- **ML Models** — Technical-only and Hybrid (technical + sentiment) RandomForest models with walk-forward cross-validation
+- **13 Stationary Technical Features** — RSI-14, close/SMA-50 ratio, OBV z-score, price-normalized MACD, Bollinger %B + width, ATR%, lagged returns, volatility, volume ratio (all price-level independent so one model generalizes across tickers)
+- **ML Models** — Technical-only and Hybrid (technical + sentiment) RandomForest models trained on **all tickers pooled** with walk-forward cross-validation
 - **Backtesting** — Walk-forward with transaction costs (10 bps), Sharpe ratio, max drawdown, win rate
 - **Streamlit Dashboard** — Dynamic sidebar with country/sector/ticker filtering, live charts, model selection, CSV upload, alerts
 - **Ticker Registry** — 30 US stocks + 10 Kenyan stocks, centralized in `utils/tickers.py`
@@ -59,7 +59,7 @@ Stock AI is an AI-powered stock price prediction system that combines historical
 ```
 stock-ai/
 ├── app.py                              # Streamlit dashboard (dynamic sidebar)
-├── requirements.txt                    # 32 dependencies
+├── requirements.txt                    # ~20 dependencies
 ├── .env.example                        # API key template
 ├── README.md                           # Project documentation
 │
@@ -184,16 +184,18 @@ All features are defined in `utils/features.py`. This is the single source of tr
 
 ### 4.1 Technical Features (13)
 
+**All features are stationary** — none depends on the absolute price level. This is deliberate: models are validated walk-forward (train on the past, test on the future) and one model serves every ticker, so raw price-level features (a 50-day SMA, Bollinger band *prices*, cumulative OBV, raw MACD, raw ATR — all of which scale with price) would feed the model values it never saw in training and would be meaningless across tickers. Each level is therefore expressed as a ratio, percentage, band position, or rolling z-score.
+
 | # | Feature | Category | Computation |
 |---|---------|----------|-------------|
-| 1 | `rsi_14` | Momentum | 14-period Relative Strength Index |
-| 2 | `sma_50` | Trend | 50-day Simple Moving Average |
-| 3 | `volume_obv` | Volume | On-Balance Volume (cumulative) |
-| 4 | `macd_line` | Trend | EMA(12) - EMA(26) |
-| 5 | `macd_signal` | Trend | 9-period EMA of MACD line |
-| 6 | `bb_upper` | Volatility | SMA(20) + 2 × std(20) |
-| 7 | `bb_lower` | Volatility | SMA(20) - 2 × std(20) |
-| 8 | `atr_14` | Volatility | 14-period Average True Range |
+| 1 | `rsi_14` | Momentum | 14-period RSI (bounded 0-100; 100 on a zero-loss window) |
+| 2 | `price_sma50_ratio` | Trend | `Close / SMA(50) - 1` (distance from trend) |
+| 3 | `obv_zscore_50` | Volume | 50-day rolling z-score of On-Balance Volume |
+| 4 | `macd_norm` | Trend | `(EMA12 - EMA26) / Close` |
+| 5 | `macd_signal_norm` | Trend | `EMA(9) of MACD line / Close` |
+| 6 | `bb_pct_b` | Volatility | Bollinger %B: `(Close - lower) / (upper - lower)` |
+| 7 | `bb_width` | Volatility | `(upper - lower) / SMA(20)` |
+| 8 | `atr_pct` | Volatility | `ATR(14) / Close` |
 | 9 | `return_1d` | Momentum | 1-day percentage change |
 | 10 | `return_5d` | Momentum | 5-day percentage change |
 | 11 | `return_10d` | Momentum | 10-day percentage change |
@@ -208,19 +210,28 @@ All 13 technical features + `sentiment_score` (daily average BERTweet sentiment,
 
 - **Input:** DataFrame with Date, Close, Volume (required); High, Low (optional for ATR)
 - **Output:** Same DataFrame with all 13 feature columns added
-- **Warmup:** First ~50 rows will have NaN for SMA-50 (handled by dropna in training)
-- **ATR fallback:** If High/Low columns are missing, uses Close × 0.02 as ATR proxy
+- **Warmup:** First ~50 rows will have NaN (SMA-50 / OBV z-score window); handled by dropna in training
+- **ATR fallback:** If High/Low columns are missing, ATR uses the 14-day mean of absolute daily close changes instead of the true range
 
 ### 4.4 Constants
 
 ```python
 TECHNICAL_FEATURES = [
-    "rsi_14", "sma_50", "volume_obv", "macd_line", "macd_signal",
-    "bb_upper", "bb_lower", "atr_14", "return_1d", "return_5d",
-    "return_10d", "volatility_10d", "volume_ratio_20d",
+    "rsi_14", "price_sma50_ratio", "obv_zscore_50", "macd_norm",
+    "macd_signal_norm", "bb_pct_b", "bb_width", "atr_pct",
+    "return_1d", "return_5d", "return_10d", "volatility_10d",
+    "volume_ratio_20d",
 ]
 HYBRID_FEATURES = TECHNICAL_FEATURES + ["sentiment_score"]
+
+# Shared model hyperparameters (used by training, retraining AND backtest)
+MODEL_PARAMS = {
+    "technical": {"n_estimators": 200, "max_depth": 8, "min_samples_leaf": 20, ...},
+    "hybrid":    {"n_estimators": 200, "max_depth": 8, "min_samples_leaf": 20, ...},
+}
 ```
+
+`utils/dataset.py` centralizes training-set assembly: `load_features()`, `add_target()` (builds the next-day-up label **per ticker** so pooling doesn't leak across ticker boundaries), and `merge_sentiment()`.
 
 ---
 
@@ -247,19 +258,19 @@ The training window expands with each fold while the test window always moves fo
 
 ### 5.2 Technical Model (`scripts/training/train_technical.py`)
 
-- **Data:** AAPL from `features.csv`, ~1,206 valid rows
-- **Features:** 13 technical indicators (`TECHNICAL_FEATURES`)
-- **Target:** Binary — 1 if next day's Close > today's Close, else 0
-- **Model:** `RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)`
+- **Data:** **all 40 tickers pooled** from `features.csv` (~38k valid rows), not AAPL alone
+- **Features:** 13 stationary technical features (`TECHNICAL_FEATURES`)
+- **Target:** Binary, computed **per ticker** — 1 if that ticker's next-day Close > today's Close
+- **Model:** `RandomForestClassifier(**MODEL_PARAMS["technical"])` (200 trees, depth 8, min_samples_leaf 20)
 - **Output:** `models/technical_model.pkl`, `logs/technical_metrics.json`
 - Prints feature importances ranked by weight
 
 ### 5.3 Hybrid Model (`scripts/training/train_hybrid.py`)
 
-- **Data:** AAPL from `features.csv` merged with `news_sentiment.csv`
+- **Data:** all tickers pooled from `features.csv` merged with `news_sentiment.csv`
 - **Merge:** Left join on (Date, Ticker), missing sentiment filled with 0.5 (neutral)
 - **Features:** 14 hybrid features (`HYBRID_FEATURES`)
-- **Model:** `RandomForestClassifier(n_estimators=100, random_state=42)`
+- **Model:** `RandomForestClassifier(**MODEL_PARAMS["hybrid"])`
 - **Output:** `models/hybrid_model.pkl`, `logs/hybrid_metrics.json`
 
 ### 5.4 Model Comparison (`scripts/training/compare_models.py`)
@@ -514,6 +525,7 @@ The `generate_alert()` function:
   3. Run `fetch_us_stocks.py`
   4. Auto-commit updated CSVs to `data/us/`
 - **Error handling:** Creates a GitHub issue on failure with workflow logs link
+- **Churn control:** `fetch_us_stocks.py` rounds prices to 4 dp and is **append-only** — existing dated rows are kept as first written (never re-adjusted to new dividend/split factors), so each daily commit adds ~1 line per file instead of rewriting the whole 5-year history. (A one-time rewrite rounded the existing files.)
 
 ### 11.4 Weekly Retrain (`retrain.yml`)
 
@@ -591,35 +603,35 @@ The `.gitignore` excludes:
 
 ### 14.2 Model Limitations
 
-- Models are trained on **AAPL only** — predictions for other tickers use the AAPL-trained model
-- Sentiment data is currently **placeholder** (0.5 neutral) until NewsAPI key is configured
-- ~50% accuracy is near random — models have not yet demonstrated predictive alpha
-- Both models **underperform buy-and-hold** after transaction costs in backtesting
-- No hyperparameter tuning beyond default settings
-- Binary classification (UP/DOWN) ignores magnitude of price moves
+- Sentiment data is still mostly **placeholder** (0.5 neutral) — the free NewsAPI tier only reaches ~30 days, so the hybrid model barely differs from the technical one. Real historical sentiment is the biggest remaining lever.
+- ~52% accuracy / 0.53 AUC is a **modest** edge, not a strong one
+- Both strategies are now profitable but still **trail buy-and-hold on total return** in a bull market (they match/beat it on drawdown)
+- Minimal hyperparameter tuning (shared `MODEL_PARAMS`, no grid search)
+- Binary classification (UP/DOWN) ignores the magnitude of price moves
 
 ---
 
 ## 15. Model Performance
 
-### 15.1 Walk-Forward CV Results (AAPL)
+### 15.1 Walk-Forward CV Results (all tickers pooled, ~38k samples)
 
 | Model | Accuracy | F1 | AUC | Notes |
 |-------|----------|----|-----|-------|
-| Technical (RF) | ~50.4% | 0.547 | 0.507 | Near random |
-| Hybrid (RF) | ~47.9% | 0.474 | 0.507 | Placeholder sentiment |
-| GradientBoosting | ~50.8% | 0.524 | 0.502 | Slightly better F1 |
+| Technical (RF) | ~52.0% | 0.451 | **0.530** | Real (modest) edge, generalizes across 40 tickers |
+| Hybrid (RF) | ~51.9% | 0.446 | **0.529** | Sentiment still mostly placeholder (0.5) |
+
+Compared with the previous AAPL-only, non-stationary-feature models (AUC ≈ 0.50, i.e. random), making the features stationary and pooling all tickers moved AUC to ~0.53 — a small but genuine signal measured out-of-sample across the whole universe.
 
 ### 15.2 Backtesting Results (AAPL, 10 bps costs)
 
 | Metric | Technical Strategy | Hybrid Strategy | Buy & Hold |
 |--------|-------------------|----------------|------------|
-| Total Return | -31.0% | -14.7% | +55.8% |
-| Sharpe Ratio | -0.292 | -0.085 | 0.537 |
-| Max Drawdown | -44.9% | -29.7% | -33.4% |
-| Win Rate | 44.3% | 45.3% | — |
+| Total Return | +60.3% | +66.4% | +113.6% |
+| Sharpe Ratio | 0.645 | 0.686 | 0.842 |
+| Max Drawdown | -36.4% | **-27.8%** | -33.4% |
+| Win Rate | 45.5% | 45.8% | — |
 
-**Conclusion:** Both models currently lose to buy-and-hold. Real sentiment data and per-ticker model training are expected to improve results.
+**Conclusion:** Both strategies are now **profitable** (previously −31% / −15%) and the hybrid's drawdown beats buy-and-hold. They still trail buy-and-hold on total return, which is expected for a long/flat strategy during a strong bull market. The backtest fits a fresh model per walk-forward fold using the **same `MODEL_PARAMS`** that ship, so these numbers describe the deployed model. Real sentiment coverage remains the main lever left.
 
 ### 15.3 Feature Importances (Technical Model)
 
@@ -809,7 +821,7 @@ python scripts/preprocessing/preprocess_data.py
 | `tests/` | 5 files |
 | `models/` | technical_model.pkl (358 KB), hybrid_model.pkl (3.8 MB) |
 | `data/` | US (30 CSVs), Kenya (7 CSVs), processed (features.csv ~13 MB) |
-| `requirements.txt` | 32 dependencies |
+| `requirements.txt` | ~20 dependencies |
 
 ---
 
