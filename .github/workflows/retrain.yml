@@ -27,6 +27,11 @@ jobs:
       - name: Preprocess data
         run: python scripts/preprocessing/preprocess_data.py
 
+      - name: Fetch historical sentiment (optional)
+        env:
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+        run: python scripts/fetching/fetch_alpha_sentiment.py
+
       - name: Retrain models
         run: python scripts/training/retrain_models.py
 
@@ -34,7 +39,7 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git add models/
+          git add models/ data/processed/kenya_features.csv
           git diff --staged --quiet && echo "No changes to commit" && exit 0
           git commit -m "Auto-retrain models"
           git push

@@ -36,3 +36,6 @@ jobs:
 
       - name: Check Python syntax
         run: python -m py_compile app.py
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -q

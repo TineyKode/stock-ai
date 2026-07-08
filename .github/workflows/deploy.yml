@@ -21,5 +21,5 @@ jobs:
           else
             curl -X POST "https://share.streamlit.io/deploy" \
               -H "Authorization: Bearer $STREAMLIT_TOKEN" \
-              -d "repo=tonykihu/stock-ai&main_file=app.py"
+              -d "repo=TineyKode/stock-ai&main_file=app.py"
           fi

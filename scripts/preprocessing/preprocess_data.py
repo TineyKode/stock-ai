@@ -175,6 +175,16 @@ def preprocess_data():
     print(f"  Tickers: {combined['Ticker'].unique().tolist()}")
     print(f"  Columns: {available}")
 
+    # Also write a committed Kenya-only slice. The full features.csv is
+    # gitignored (large, churns every retrain) and US data is fetched live
+    # from yfinance in the app, but NSE tickers have no live source — so the
+    # deployed dashboard needs this small file to show Kenya charts/signals.
+    kenya = combined[combined["Market"] == "Kenya"]
+    if not kenya.empty:
+        kenya[available].to_csv("data/processed/kenya_features.csv", index=False)
+        print(f"\nKenya slice saved to data/processed/kenya_features.csv "
+              f"({len(kenya)} rows, {kenya['Ticker'].nunique()} tickers)")
+
 
 if __name__ == "__main__":
     preprocess_data()

@@ -45,6 +45,18 @@ TECHNICAL_FEATURES = [
 HYBRID_FEATURES = TECHNICAL_FEATURES + ["sentiment_score"]
 
 
+# --- Signal / target configuration -------------------------------------
+# The label is magnitude-aware: a day counts as "UP" only if the next-day
+# return clears TARGET_THRESHOLD, so the model learns to flag moves that
+# are actually worth trading rather than any move above zero.
+TARGET_THRESHOLD = 0.0015   # ~15 bps: covers a 10 bps round-trip + slippage
+
+# At inference/backtest we go long only when the model's P(up) is at least
+# SIGNAL_THRESHOLD, so the strategy trades selectively (fewer trades, less
+# cost, lower exposure on uncertain days) instead of on every predict==1.
+SIGNAL_THRESHOLD = 0.55
+
+
 # Shared model hyperparameters — one source of truth so training,
 # retraining and backtesting all evaluate and ship the SAME model.
 MODEL_PARAMS = {

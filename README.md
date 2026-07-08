@@ -1,6 +1,6 @@
 # Stock AI — Full Project Documentation
 
-**Repository:** https://github.com/tonykihu/stock-ai
+**Repository:** https://github.com/TineyKode/stock-ai
 **Branch:** main
 **Python:** 3.11+ (3.13 supported with caveats)
 
@@ -89,17 +89,14 @@ stock-ai/
 │   └── backtest_hybrid.csv
 │
 ├── scripts/
-│   ├── pipeline.py                     # Orchestration script
 │   ├── fetching/
-│   │   ├── fetch_us_stocks.py          # yfinance download (5 years)
-│   │   ├── fetch_newsapi.py            # NewsAPI headline fetcher
+│   │   ├── fetch_us_stocks.py          # yfinance download (5 years, append-only)
+│   │   ├── fetch_newsapi.py            # NewsAPI headlines (recent, ~30 days)
 │   │   ├── fetch_news.py               # BERTweet sentiment scoring
-│   │   ├── fetch_kenya_gsheets.py      # Google Sheets integration
-│   │   └── scrape_nse.py               # NSE web scraping
+│   │   ├── fetch_alpha_sentiment.py    # Alpha Vantage historical sentiment (keyed)
+│   │   └── scrape_nse.py               # NSE web scraper (standalone, not wired in)
 │   ├── preprocessing/
-│   │   ├── preprocess_data.py          # Main preprocessing (US + Kenya)
-│   │   ├── preprocess_kenya.py         # Kenya-specific processing
-│   │   └── process_nse.py              # NSE data processing
+│   │   └── preprocess_data.py          # Main preprocessing (US + committed Kenya slice)
 │   ├── training/
 │   │   ├── train_technical.py          # Technical model (walk-forward CV)
 │   │   ├── train_hybrid.py             # Hybrid model (walk-forward CV)
@@ -224,6 +221,10 @@ TECHNICAL_FEATURES = [
 ]
 HYBRID_FEATURES = TECHNICAL_FEATURES + ["sentiment_score"]
 
+# Magnitude-aware label + selective-trading thresholds
+TARGET_THRESHOLD = 0.0015   # a day is "UP" only if next-day return > ~15 bps
+SIGNAL_THRESHOLD = 0.55     # go long only when the model's P(up) >= this
+
 # Shared model hyperparameters (used by training, retraining AND backtest)
 MODEL_PARAMS = {
     "technical": {"n_estimators": 200, "max_depth": 8, "min_samples_leaf": 20, ...},
@@ -231,7 +232,7 @@ MODEL_PARAMS = {
 }
 ```
 
-`utils/dataset.py` centralizes training-set assembly: `load_features()`, `add_target()` (builds the next-day-up label **per ticker** so pooling doesn't leak across ticker boundaries), and `merge_sentiment()`.
+`utils/dataset.py` centralizes training-set assembly: `load_features()`, `add_target()` (builds the **magnitude-aware** next-day label **per ticker** — 1 only if the next-day return clears `TARGET_THRESHOLD` — so pooling doesn't leak across ticker boundaries and tiny sub-cost moves aren't labelled as buys), and `merge_sentiment()`.
 
 ---
 
@@ -260,7 +261,7 @@ The training window expands with each fold while the test window always moves fo
 
 - **Data:** **all 40 tickers pooled** from `features.csv` (~38k valid rows), not AAPL alone
 - **Features:** 13 stationary technical features (`TECHNICAL_FEATURES`)
-- **Target:** Binary, computed **per ticker** — 1 if that ticker's next-day Close > today's Close
+- **Target:** Magnitude-aware, computed **per ticker** — 1 if that ticker's next-day return clears `TARGET_THRESHOLD` (~15 bps), else 0 (so sub-cost noise moves aren't labelled as buys)
 - **Model:** `RandomForestClassifier(**MODEL_PARAMS["technical"])` (200 trees, depth 8, min_samples_leaf 20)
 - **Output:** `models/technical_model.pkl`, `logs/technical_metrics.json`
 - Prints feature importances ranked by weight
@@ -301,9 +302,9 @@ The backtester simulates trading using model predictions on unseen data folds.
 
 **Methodology:**
 1. `TimeSeriesSplit` creates chronological folds
-2. Train model on historical fold
-3. Predict on next fold (unseen data)
-4. Trading rules: hold position if prediction=1 (UP), cash if prediction=0 (DOWN)
+2. Train model on historical fold (magnitude-aware `TARGET_THRESHOLD` label)
+3. Predict `P(up)` on next fold (unseen data)
+4. **Selective trading:** go long only when `P(up) >= SIGNAL_THRESHOLD` (0.55), else hold cash — this trades fewer, higher-confidence days instead of on every `predict==1`
 5. Apply transaction costs when position changes
 6. Calculate daily portfolio returns across all folds
 
@@ -369,6 +370,28 @@ When merging sentiment with features for training or backtesting:
 - Always use `how="left"` join (keep all feature rows)
 - Fill missing sentiment with 0.5 (neutral) via `.fillna(0.5)`
 - This prevents data loss when dates don't match (common with free-tier API limits)
+
+### 7.5 Historical Sentiment (`scripts/fetching/fetch_alpha_sentiment.py`)
+
+The NewsAPI chain above only reaches ~30 days on the free tier, so it cannot
+populate sentiment across the multi-year training window — which is why the
+hybrid model has been nearly identical to the technical one.
+`fetch_alpha_sentiment.py` fills that gap using Alpha Vantage's
+`NEWS_SENTIMENT` endpoint (free: 25 req/day, 5/min; history back to 2022):
+
+- Uses the **per-ticker** sentiment score of each article, averaged per day
+- Maps Alpha Vantage's `[-1, 1]` score to the pipeline's `[0, 1]` scale
+- Writes the same `data/processed/news_sentiment.csv` the hybrid model reads
+- **Requires `ALPHA_VANTAGE_KEY`.** Without a key it prints a notice and exits
+  0 (hybrid then falls back to neutral 0.5), so it is CI-safe to call blind.
+
+```bash
+# populate real historical sentiment (needs ALPHA_VANTAGE_KEY in .env)
+python scripts/fetching/fetch_alpha_sentiment.py --time-from 20220101
+```
+
+Obtaining and setting the key is the one remaining step to make the hybrid
+model train on real sentiment rather than the neutral placeholder.
 
 ---
 
@@ -507,13 +530,13 @@ The `generate_alert()` function:
 
 - **Triggers:** Push to main/master, pull requests
 - **Python:** 3.11
-- **Steps:** Install dependencies → syntax check `app.py` → verify Streamlit version
+- **Steps:** Install dependencies → verify Streamlit version → syntax check `app.py` → **run unit tests** (`pytest tests/`)
 
 ### 11.2 Streamlit Deployment (`deploy.yml`)
 
 - **Triggers:** Push to main, manual dispatch
 - **Logic:** If `STREAMLIT_TOKEN` secret is set, POST to Streamlit API; otherwise auto-deploy from main
-- **Target:** `tonykihu/stock-ai`, main file: `app.py`
+- **Target:** `TineyKode/stock-ai`, main file: `app.py`
 
 ### 11.3 Daily US Data Fetch (`fetch_us.yml`)
 
@@ -542,15 +565,23 @@ The `generate_alert()` function:
 
 ## 12. Test Suite
 
-| Test File | What It Tests | Notes |
-|-----------|---------------|-------|
-| `test_sentiment.py` | BERTweet model loads and scores sample headlines | Requires transformers + torch |
-| `test_yfinance.py` | Downloads 1 month of AAPL data | Requires internet |
-| `test_nse.py` | Scrapes NSE with BeautifulSoup | Static HTML parsing |
-| `test_nse_scraper.py` | Selenium-based NSE scraping | Requires ChromeDriver |
-| `test_gsheets.py` | Google Sheets authentication | Requires credentials.json |
+**Unit tests** (deterministic, no network — run in CI):
 
-Run tests:
+| Test File | What It Tests |
+|-----------|---------------|
+| `test_features.py` | `compute_features`: all features present, **scale-invariance** (the stationarity guarantee), warmup NaN preserved, RSI bounds / no-loss=100 |
+| `test_dataset.py` | `add_target`: per-ticker label with no cross-ticker leakage, `TARGET_THRESHOLD` filtering; `merge_sentiment` neutral fill |
+| `test_alpha_sentiment.py` | Alpha Vantage `score_to_unit` mapping/clamping and `parse_feed_to_daily` daily aggregation (against a fixture) |
+
+**Manual smoke scripts** (network/heavy deps, run by hand — named `check_*` so pytest doesn't collect them):
+
+| Script | What It Checks |
+|--------|----------------|
+| `check_sentiment.py` | BERTweet model loads and scores sample headlines |
+| `check_nse_scraper.py` | NSE scrape via requests + BeautifulSoup |
+| `check_nse_selenium.py` | NSE scrape via Selenium (needs ChromeDriver) |
+
+Run the unit tests:
 ```bash
 python -m pytest tests/
 ```
@@ -568,8 +599,8 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `NEWSAPI_KEY` | For sentiment | Free from newsapi.org |
-| `ALPHA_VANTAGE_KEY` | No | Placeholder (not currently used) |
+| `NEWSAPI_KEY` | For recent sentiment | Free from newsapi.org (~30 days history) |
+| `ALPHA_VANTAGE_KEY` | For historical sentiment | Free from alphavantage.co; used by `fetch_alpha_sentiment.py` to backfill multi-year sentiment |
 | `GMAIL_USER` | For email alerts | Gmail address |
 | `GMAIL_APP_PASSWORD` | For email alerts | Gmail app password |
 | `GMAIL_RECIPIENT` | For email alerts | Alert recipient |
@@ -583,8 +614,13 @@ The `.gitignore` excludes:
 - Virtual environments (`venv/`, `.venv/`)
 - IDE files (`.vscode/`, `.idea/`, `.claude/`)
 - Credentials (`*.env`, `credentials.json`)
-- Generated files (`models/*.pkl`, `data/processed/`, `logs/`, `feedback/`)
+- Generated files (`data/processed/*`, `logs/`, `feedback/`)
 - OS files (`.DS_Store`, `Thumbs.db`, `nul`)
+
+**Committed exceptions:** trained `models/*.pkl` (so they deploy) and
+`data/processed/kenya_features.csv` (the small NSE slice — the deployed app
+needs it because Kenya has no live data source, while US data is fetched live
+from yfinance and the full `features.csv` stays ignored).
 
 ---
 
@@ -603,11 +639,11 @@ The `.gitignore` excludes:
 
 ### 14.2 Model Limitations
 
-- Sentiment data is still mostly **placeholder** (0.5 neutral) — the free NewsAPI tier only reaches ~30 days, so the hybrid model barely differs from the technical one. Real historical sentiment is the biggest remaining lever.
-- ~52% accuracy / 0.53 AUC is a **modest** edge, not a strong one
-- Both strategies are now profitable but still **trail buy-and-hold on total return** in a bull market (they match/beat it on drawdown)
-- Minimal hyperparameter tuning (shared `MODEL_PARAMS`, no grid search)
-- Binary classification (UP/DOWN) ignores the magnitude of price moves
+- Sentiment defaults to **neutral 0.5** until `ALPHA_VANTAGE_KEY` is set and `fetch_alpha_sentiment.py` is run. The historical-sentiment path now exists (§7.5); running it with a key is the biggest remaining lever on model quality.
+- ~0.53 AUC is a **modest** edge, not a strong one
+- The selective long/flat strategy **trails buy-and-hold on total return** in a bull market, but with **roughly half the drawdown** and comparable Sharpe (§15.2)
+- Minimal hyperparameter tuning (shared `MODEL_PARAMS`, no grid search); `SIGNAL_THRESHOLD`/`TARGET_THRESHOLD` are principled defaults, not fit to the backtest
+- The label is directional (return above/below a threshold), not a full return-magnitude regression
 
 ---
 
@@ -617,32 +653,35 @@ The `.gitignore` excludes:
 
 | Model | Accuracy | F1 | AUC | Notes |
 |-------|----------|----|-----|-------|
-| Technical (RF) | ~52.0% | 0.451 | **0.530** | Real (modest) edge, generalizes across 40 tickers |
-| Hybrid (RF) | ~51.9% | 0.446 | **0.529** | Sentiment still mostly placeholder (0.5) |
+| Technical (RF) | 53.8% | 0.111 | **0.530** | Real (modest) edge, generalizes across 40 tickers |
+| Hybrid (RF) | 53.6% | 0.097 | **0.529** | Sentiment neutral (0.5) until Alpha Vantage key is set |
+
+**AUC is the metric that matters here.** F1 is low because it is measured at the default 0.5 cut against the magnitude-aware label (a conservative model rarely crosses 0.5), whereas the strategy actually trades at `P(up) >= 0.55` — so ranking quality (AUC), not the 0.5-cut F1, drives the backtest.
 
 Compared with the previous AAPL-only, non-stationary-feature models (AUC ≈ 0.50, i.e. random), making the features stationary and pooling all tickers moved AUC to ~0.53 — a small but genuine signal measured out-of-sample across the whole universe.
 
-### 15.2 Backtesting Results (AAPL, 10 bps costs)
+### 15.2 Backtesting Results (AAPL, 10 bps costs, selective trading)
 
 | Metric | Technical Strategy | Hybrid Strategy | Buy & Hold |
 |--------|-------------------|----------------|------------|
-| Total Return | +60.3% | +66.4% | +113.6% |
-| Sharpe Ratio | 0.645 | 0.686 | 0.842 |
-| Max Drawdown | -36.4% | **-27.8%** | -33.4% |
-| Win Rate | 45.5% | 45.8% | — |
+| Total Return | +38.3% | +53.2% | +113.6% |
+| Sharpe Ratio | 0.630 | **0.822** | 0.842 |
+| Max Drawdown | **-15.7%** | **-15.3%** | -33.4% |
+| Win Rate | 41.0% | 39.5% | — |
+| Trades (over 990 days) | 108 | 122 | — |
 
-**Conclusion:** Both strategies are now **profitable** (previously −31% / −15%) and the hybrid's drawdown beats buy-and-hold. They still trail buy-and-hold on total return, which is expected for a long/flat strategy during a strong bull market. The backtest fits a fresh model per walk-forward fold using the **same `MODEL_PARAMS`** that ship, so these numbers describe the deployed model. Real sentiment coverage remains the main lever left.
+**Conclusion:** With the magnitude-aware label and selective `SIGNAL_THRESHOLD=0.55` trading, the **hybrid strategy now nearly matches buy-and-hold's Sharpe (0.822 vs 0.842) with less than half the drawdown (−15.3% vs −33.4%)** and trades only ~120 times over ~4 years. It trails on total return, which is expected for a long/flat strategy in a strong bull market — the trade-off is far lower risk. The backtest fits a fresh model per walk-forward fold using the **same `MODEL_PARAMS`** and thresholds that ship, so these numbers describe the deployed model. Running real sentiment (§7.5) is the main lever left.
 
 ### 15.3 Feature Importances (Technical Model)
 
 Top features by RandomForest importance:
-1. `macd_line` (9.3%)
-2. `volume_ratio_20d` (8.8%)
-3. `return_1d` (8.4%)
-4. `volume_obv` (8.4%)
-5. `return_5d` (8.4%)
+1. `volume_ratio_20d` (17.2%)
+2. `bb_width` (9.6%)
+3. `volatility_10d` (9.4%)
+4. `return_1d` (9.3%)
+5. `atr_pct` (7.1%)
 
-Features are relatively evenly distributed, suggesting no single dominant predictor.
+Volume and volatility features dominate; the remaining features are fairly evenly distributed.
 
 ---
 
@@ -659,6 +698,7 @@ Features are relatively evenly distributed, suggesting no single dominant predic
 | ML Frameworks | tensorflow, xgboost |
 | Visualization | plotly |
 | Google Sheets | gspread |
+| Testing | pytest |
 
 ### 16.2 Install
 
@@ -679,7 +719,7 @@ pip install streamlit pandas numpy scikit-learn joblib yfinance ta plotly
 
 ```bash
 # Clone
-git clone https://github.com/tonykihu/stock-ai.git
+git clone https://github.com/TineyKode/stock-ai.git
 cd stock-ai
 
 # Install
@@ -708,9 +748,12 @@ python scripts/fetching/fetch_us_stocks.py
 # 2. Preprocess
 python scripts/preprocessing/preprocess_data.py
 
-# 3. Sentiment (requires NEWSAPI_KEY in .env)
+# 3. Sentiment (optional)
+#    recent (~30d) via NewsAPI, requires NEWSAPI_KEY:
 python scripts/fetching/fetch_newsapi.py
 python scripts/fetching/fetch_news.py
+#    OR multi-year history via Alpha Vantage, requires ALPHA_VANTAGE_KEY:
+python scripts/fetching/fetch_alpha_sentiment.py --time-from 20220101
 
 # 4. Train
 python scripts/training/train_technical.py

@@ -26,17 +26,26 @@ def load_features(path=FEATURES_PATH):
     return pd.read_csv(path)
 
 
-def add_target(df):
+def add_target(df, threshold=None):
     """
-    Add a binary next-day-up Target computed independently per ticker.
+    Add a magnitude-aware next-day Target computed independently per ticker.
 
-    The last row of each ticker has no next day, so its Target is NaN
-    (the caller drops it). This prevents cross-ticker leakage that a
-    naive Close.shift(-1) on pooled data would introduce.
+    Target = 1 if the next-day return exceeds `threshold`, else 0. Using a
+    small positive threshold (default utils.features.TARGET_THRESHOLD) makes
+    the label ignore moves too small to trade profitably after costs.
+
+    The last row of each ticker has no next day, so its Target is NaN (the
+    caller drops it). Computing per ticker prevents the cross-ticker leakage
+    that a naive Close.shift(-1) on pooled data would introduce.
     """
+    if threshold is None:
+        from utils.features import TARGET_THRESHOLD
+        threshold = TARGET_THRESHOLD
+
     df = df.sort_values(["Ticker", "Date"]).copy()
     next_close = df.groupby("Ticker")["Close"].shift(-1)
-    df["Target"] = (next_close > df["Close"]).astype(float)
+    next_return = next_close / df["Close"] - 1.0
+    df["Target"] = (next_return > threshold).astype(float)
     df.loc[next_close.isna(), "Target"] = np.nan
     return df
 

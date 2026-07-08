@@ -30,3 +30,6 @@ plotly
 
 # Google Sheets (optional)
 gspread
+
+# Testing
+pytest

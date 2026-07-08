@@ -15,7 +15,13 @@ import joblib
 from sklearn.model_selection import TimeSeriesSplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.features import TECHNICAL_FEATURES, HYBRID_FEATURES, MODEL_PARAMS
+from utils.features import (
+    TECHNICAL_FEATURES,
+    HYBRID_FEATURES,
+    MODEL_PARAMS,
+    TARGET_THRESHOLD,
+    SIGNAL_THRESHOLD,
+)
 
 
 TRANSACTION_COST_BPS = 10  # 10 basis points per trade
@@ -63,10 +69,16 @@ def win_rate(returns):
 
 
 def backtest_model(model, X, close_prices, feature_names, n_splits=5,
-                   cost_bps=TRANSACTION_COST_BPS):
+                   cost_bps=TRANSACTION_COST_BPS,
+                   target_threshold=TARGET_THRESHOLD,
+                   signal_threshold=SIGNAL_THRESHOLD):
     """
     Walk-forward backtest: train on past folds, predict on next fold,
     simulate returns with transaction costs.
+
+    The label is magnitude-aware (next-day return > target_threshold) and
+    the strategy trades selectively: go long only when the model's P(up)
+    is at least signal_threshold, otherwise hold cash.
 
     Returns dict of metrics and a DataFrame of daily results.
     """
@@ -78,21 +90,24 @@ def backtest_model(model, X, close_prices, feature_names, n_splits=5,
         close_train = close_prices.iloc[train_idx]
         close_test = close_prices.iloc[test_idx]
 
-        # Target: next-day price up
-        y_train = (close_train.shift(-1) > close_train).astype(int).iloc[:-1]
+        # Magnitude-aware target: next-day return clears the threshold
+        train_ret = close_train.shift(-1) / close_train - 1.0
+        y_train = (train_ret > target_threshold).astype(int).iloc[:-1]
         X_train = X_train.iloc[:-1]
 
-        # Align test target (for evaluation, not used in trading)
-        y_test = (close_test.shift(-1) > close_test).astype(int).iloc[:-1]
         X_test_aligned = X_test.iloc[:-1]
         close_test_aligned = close_test.iloc[:-1]
 
         if len(X_train) < 50 or len(X_test_aligned) < 5:
             continue
 
-        # Train and predict
+        # Train, then go long only on high-confidence up-days
         model.fit(X_train, y_train)
-        predictions = model.predict(X_test_aligned)
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X_test_aligned)[:, 1]
+        else:
+            proba = model.predict(X_test_aligned).astype(float)
+        predictions = (proba >= signal_threshold).astype(int)
 
         # Daily market returns
         market_returns = close_test_aligned.pct_change().shift(-1).iloc[:-1]

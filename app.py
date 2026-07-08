@@ -4,7 +4,12 @@ import pandas as pd
 import joblib
 import yfinance as yf
 from datetime import datetime
-from utils.features import compute_features, TECHNICAL_FEATURES, HYBRID_FEATURES
+from utils.features import (
+    compute_features,
+    TECHNICAL_FEATURES,
+    HYBRID_FEATURES,
+    SIGNAL_THRESHOLD,
+)
 from utils.alerts import send_email_alert, send_discord_alert
 from utils.tickers import (
     TICKER_REGISTRY,
@@ -20,6 +25,27 @@ from utils.tickers import (
 st.set_page_config(page_title="AI Stock Signal Dashboard", layout="wide")
 
 FEATURES_PATH = "data/processed/features.csv"
+# Committed Kenya slice: US data is fetched live from yfinance, but NSE tickers
+# have no live source, so this small file ships in the repo so the deployed app
+# has Kenya data even though the full features.csv is gitignored.
+KENYA_FEATURES_PATH = "data/processed/kenya_features.csv"
+
+
+def _feature_source(country):
+    """Pick the processed feature file to read for a country."""
+    if country == "Kenya" and os.path.exists(KENYA_FEATURES_PATH):
+        return KENYA_FEATURES_PATH
+    return FEATURES_PATH
+
+
+def _existing_feature_files():
+    """Processed feature files present on disk (deduped, Kenya slice first)."""
+    seen, paths = set(), []
+    for p in (FEATURES_PATH, KENYA_FEATURES_PATH):
+        if os.path.exists(p) and p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
 
 
 # --- Load models safely ---
@@ -45,7 +71,8 @@ def discover_available_tickers():
     Returns (set of ticker symbols, dict of ticker->market).
     Falls back to TICKER_REGISTRY if features.csv doesn't exist.
     """
-    if not os.path.exists(FEATURES_PATH):
+    feature_files = _existing_feature_files()
+    if not feature_files:
         all_tickers = set()
         ticker_markets = {}
         for country, sectors in TICKER_REGISTRY.items():
@@ -55,7 +82,12 @@ def discover_available_tickers():
                     ticker_markets[entry["ticker"]] = country
         return all_tickers, ticker_markets
 
-    df = pd.read_csv(FEATURES_PATH, usecols=["Ticker", "Market"])
+    # Union the full (local) features.csv and the committed Kenya slice so
+    # both markets appear whether or not features.csv is present.
+    df = pd.concat(
+        [pd.read_csv(p, usecols=["Ticker", "Market"]) for p in feature_files],
+        ignore_index=True,
+    )
     available = set(df["Ticker"].unique())
     # Map Market column values to country names
     market_to_country = {"US": "US", "Kenya": "Kenya"}
@@ -129,11 +161,11 @@ def build_sidebar_filters(available_tickers, ticker_markets):
     return selected_ticker, selected_country
 
 
-def fetch_latest_from_features(ticker):
-    """Load the most recent valid row for a ticker from features.csv."""
-    if not os.path.exists(FEATURES_PATH):
+def fetch_latest_from_features(ticker, path=FEATURES_PATH):
+    """Load the most recent valid row for a ticker from a processed file."""
+    if not os.path.exists(path):
         return None
-    df = pd.read_csv(FEATURES_PATH)
+    df = pd.read_csv(path)
     df = df[df["Ticker"] == ticker].copy()
     # Drop rows with NaN Date or NaN features
     df = df.dropna(subset=["Date", "Close"])
@@ -147,8 +179,8 @@ def fetch_latest_from_features(ticker):
 def fetch_latest_data(ticker, country):
     """Fetch latest stock data and compute all features."""
     if country == "Kenya":
-        # Kenya: use preprocessed features.csv (yfinance doesn't cover NSE well)
-        data = fetch_latest_from_features(ticker)
+        # Kenya: use the committed processed slice (yfinance doesn't cover NSE)
+        data = fetch_latest_from_features(ticker, _feature_source("Kenya"))
         if data is not None:
             return data
         st.warning(f"No processed data for {ticker}. Run preprocessing first.")
@@ -223,8 +255,9 @@ if data is not None:
         else:
             features = data[TECHNICAL_FEATURES].dropna()
             if not features.empty:
-                prediction = models["technical"].predict(features)
-                st.metric("Signal", "BUY" if prediction[0] == 1 else "HOLD/SELL")
+                proba = float(models["technical"].predict_proba(features)[:, 1][0])
+                signal = "BUY" if proba >= SIGNAL_THRESHOLD else "HOLD/SELL"
+                st.metric("Signal", signal, delta=f"P(up) {proba:.0%}")
             else:
                 st.warning(
                     f"Feature values contain NaN for {selected_ticker}. "
@@ -239,8 +272,9 @@ if data is not None:
         else:
             features = data[HYBRID_FEATURES].dropna()
             if not features.empty:
-                prediction = models["hybrid"].predict(features)
-                st.metric("Signal", "BUY" if prediction[0] == 1 else "HOLD/SELL")
+                proba = float(models["hybrid"].predict_proba(features)[:, 1][0])
+                signal = "BUY" if proba >= SIGNAL_THRESHOLD else "HOLD/SELL"
+                st.metric("Signal", signal, delta=f"P(up) {proba:.0%}")
             else:
                 st.warning(
                     f"Feature values contain NaN for {selected_ticker}. "
@@ -287,9 +321,10 @@ if data is not None:
         else:
             st.info(f"No chart data available for {selected_ticker}")
     else:
-        # Kenya: show from features.csv
-        if os.path.exists(FEATURES_PATH):
-            hist = pd.read_csv(FEATURES_PATH)
+        # Kenya: show from the committed Kenya slice (or features.csv locally)
+        kenya_path = _feature_source("Kenya")
+        if os.path.exists(kenya_path):
+            hist = pd.read_csv(kenya_path)
             hist = hist[hist["Ticker"] == selected_ticker].copy()
             hist["Date"] = pd.to_datetime(hist["Date"])
             hist = hist.sort_values("Date")
