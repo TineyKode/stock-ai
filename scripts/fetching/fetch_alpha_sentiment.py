@@ -46,6 +46,9 @@ OUTPUT_PATH = "data/processed/news_sentiment.csv"
 # Free tier: 25 requests per day, and about 5 per minute.
 DAILY_REQUEST_BUDGET = 25
 RATE_LIMIT_SLEEP_S = 13
+# A short NewsAPI slice is not a finished backfill. Skip a ticker only after
+# it has this many distinct days in the output file.
+MIN_DAYS_TO_SKIP = 30
 
 
 class AlphaVantageLimit(RuntimeError):
@@ -134,14 +137,15 @@ def budget_path_for(output_path):
     return os.path.join(folder, "alpha_vantage_budget.json")
 
 
-def covered_tickers(path):
-    """Tickers that already have at least one row in the sentiment file."""
+def covered_tickers(path, min_days=MIN_DAYS_TO_SKIP):
+    """Tickers whose saved history is long enough to count as a finished fetch."""
     if not os.path.exists(path):
         return set()
     existing = pd.read_csv(path)
-    if existing.empty or "Ticker" not in existing.columns:
+    if existing.empty or "Ticker" not in existing.columns or "Date" not in existing.columns:
         return set()
-    return set(existing["Ticker"].astype(str))
+    counts = existing.groupby(existing["Ticker"].astype(str))["Date"].nunique()
+    return set(counts[counts >= min_days].index)
 
 
 def load_used(path, today):
@@ -187,6 +191,7 @@ def run_sentiment_batch(
     time_from=None,
     limit=1000,
     budget=DAILY_REQUEST_BUDGET,
+    min_days=MIN_DAYS_TO_SKIP,
 ):
     """
     Fetch at most the calls left in today's budget.
@@ -196,7 +201,7 @@ def run_sentiment_batch(
     A Note or Information response stops the run and keeps the original text.
     Returns the process exit code.
     """
-    covered = covered_tickers(output_path)
+    covered = covered_tickers(output_path, min_days=min_days)
     used = load_used(budget_path, today)
     chosen = choose_tickers(tickers, covered, used, budget)
     if not chosen:

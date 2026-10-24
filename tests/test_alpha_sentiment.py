@@ -101,13 +101,13 @@ def test_batch_stops_at_the_daily_cap_and_resumes_next_day(tmp_path):
 
     calls.clear()
     code = run_sentiment_batch(
-        names, "key", str(output), str(budget), "2026-10-17", fetch, budget=25,
+        names, "key", str(output), str(budget), "2026-10-17", fetch, budget=25, min_days=1,
     )
     assert code == 0
     assert calls == []
 
     code = run_sentiment_batch(
-        names, "key", str(output), str(budget), "2026-10-18", fetch, budget=25,
+        names, "key", str(output), str(budget), "2026-10-18", fetch, budget=25, min_days=1,
     )
     assert code == 0
     assert calls == names[25:]

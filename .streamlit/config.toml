@@ -1,0 +1,78 @@
+# Dark financial dashboard.
+# Tokens from ui-ux-pro-max: OLED dark, Fira Sans, Fira Code, green accent.
+# primaryColor is a darker green so white button labels stay readable.
+
+[client]
+toolbarMode = "viewer"
+
+[theme]
+base = "dark"
+primaryColor = "#15803D"
+backgroundColor = "#020617"
+secondaryBackgroundColor = "#0E1223"
+textColor = "#F8FAFC"
+linkColor = "#38BDF8"
+borderColor = "#334155"
+codeBackgroundColor = "#0E1223"
+codeTextColor = "#E2E8F0"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
+
+font = "'Fira Sans':https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;500;600;700&display=swap"
+headingFont = "'Fira Sans':https://fonts.googleapis.com/css2?family=Fira+Sans:wght@600;700&display=swap"
+codeFont = "'Fira Code':https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&display=swap"
+baseFontSize = 14
+baseFontWeight = 400
+codeFontSize = "13px"
+headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "12px"]
+headingFontWeights = [600, 600, 600, 500, 500, 500]
+linkUnderline = false
+
+greenColor = "#22C55E"
+greenTextColor = "#4ADE80"
+greenBackgroundColor = "#052E16"
+redColor = "#EF4444"
+redTextColor = "#FCA5A5"
+redBackgroundColor = "#450A0A"
+yellowColor = "#FBBF24"
+orangeColor = "#FB923C"
+blueColor = "#38BDF8"
+violetColor = "#A78BFA"
+grayColor = "#94A3B8"
+grayTextColor = "#CBD5E1"
+grayBackgroundColor = "#1E293B"
+
+chartCategoricalColors = [
+    "#38BDF8",
+    "#22C55E",
+    "#A78BFA",
+    "#F87171",
+    "#FBBF24",
+    "#94A3B8",
+    "#FB923C",
+]
+chartSequentialColors = [
+    "#0C4A6E",
+    "#075985",
+    "#0369A1",
+    "#0284C7",
+    "#0EA5E9",
+    "#38BDF8",
+    "#7DD3FC",
+    "#BAE6FD",
+    "#E0F2FE",
+    "#F0F9FF",
+]
+
+dataframeBorderColor = "#334155"
+dataframeHeaderBackgroundColor = "#0E1223"
+
+[theme.sidebar]
+backgroundColor = "#0E1223"
+secondaryBackgroundColor = "#1E293B"
+codeBackgroundColor = "#020617"
+textColor = "#F8FAFC"
+borderColor = "#334155"
+primaryColor = "#15803D"

@@ -7,10 +7,23 @@ from datetime import datetime
 from utils.features import (
     compute_features,
     TECHNICAL_FEATURES,
-    HYBRID_FEATURES,
     SIGNAL_THRESHOLD,
 )
 from utils.alerts import send_email_alert, send_discord_alert
+from utils.price_chart import (
+    load_saved_prices,
+    normalize_yahoo,
+    price_chart,
+    price_span,
+    price_window,
+)
+from utils.signal_view import (
+    beat_line,
+    format_bar_date,
+    load_technical_summary,
+    position_label,
+    universe_metrics,
+)
 from utils.tickers import (
     TICKER_REGISTRY,
     get_ticker_name,
@@ -22,13 +35,18 @@ from utils.tickers import (
 )
 
 # --- Page config (must be first st command) ---
-st.set_page_config(page_title="AI Stock Signal Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Stock signal",
+    page_icon=":material/query_stats:",
+    layout="wide",
+)
 
 FEATURES_PATH = "data/processed/features.csv"
 # Committed Kenya slice: US data is fetched live from yfinance, but NSE tickers
 # have no live source, so this small file ships in the repo so the deployed app
 # has Kenya data even though the full features.csv is gitignored.
 KENYA_FEATURES_PATH = "data/processed/kenya_features.csv"
+BACKTEST_SUMMARY_PATH = "logs/backtest_universe.json"
 
 
 def _feature_source(country):
@@ -227,11 +245,11 @@ available_tickers, ticker_markets = discover_available_tickers()
 selected_ticker, selected_country = build_sidebar_filters(available_tickers, ticker_markets)
 
 # --- Main content ---
-st.title("AI Stock Signal Dashboard")
-st.markdown("""
-**US & Kenyan Market Predictions**
-*Data updates EOD | Models retrain weekly*
-""")
+st.title("Stock signal")
+st.caption(
+    "US prices come from Yahoo. Kenya prices are the saved NSE file, not a live feed. "
+    "Sentiment is off, so this is the technical model only."
+)
 
 if selected_ticker is None:
     st.info("Select a ticker from the sidebar to see predictions.")
@@ -240,128 +258,224 @@ if selected_ticker is None:
                     "`python scripts/training/train_technical.py`")
     st.stop()
 
-# Model selector
-model_type = st.radio("Model", ["Technical Only", "Hybrid (Technical + Sentiment)"])
+PERIOD_OPTIONS = {
+    "1 Week": 5,
+    "1 Month": 21,
+    "3 Months": 63,
+    "6 Months": 126,
+    "1 Year": 252,
+    "All Data": None,
+}
+YF_PERIODS = {
+    "1 Week": "5d",
+    "1 Month": "1mo",
+    "3 Months": "3mo",
+    "6 Months": "6mo",
+    "1 Year": "1y",
+    "All Data": "5y",
+}
+TAB_SIGNAL = ":material/query_stats: Signal"
+TAB_PRICE = ":material/show_chart: Price"
+TAB_SETTINGS = ":material/settings: Settings"
 
-# Fetch real data
-data = fetch_latest_data(selected_ticker, selected_country)
 
-# Predict
-if data is not None:
-    if model_type == "Technical Only" and "technical" in models:
-        missing = [f for f in TECHNICAL_FEATURES if f not in data.columns]
-        if missing:
-            st.warning(f"Missing features: {', '.join(missing)}. Re-run preprocessing.")
-        else:
-            features = data[TECHNICAL_FEATURES].dropna()
-            if not features.empty:
-                proba = float(models["technical"].predict_proba(features)[:, 1][0])
-                signal = "BUY" if proba >= SIGNAL_THRESHOLD else "HOLD/SELL"
-                st.metric("Signal", signal, delta=f"P(up) {proba:.0%}")
-            else:
-                st.warning(
-                    f"Feature values contain NaN for {selected_ticker}. "
-                    "Try re-running: `python scripts/preprocessing/preprocess_data.py`"
-                )
-    elif model_type == "Hybrid (Technical + Sentiment)" and "hybrid" in models:
-        if "sentiment_score" not in data.columns:
-            data["sentiment_score"] = 0.5
-        missing = [f for f in HYBRID_FEATURES if f not in data.columns]
-        if missing:
-            st.warning(f"Missing features: {', '.join(missing)}. Re-run preprocessing.")
-        else:
-            features = data[HYBRID_FEATURES].dropna()
-            if not features.empty:
-                proba = float(models["hybrid"].predict_proba(features)[:, 1][0])
-                signal = "BUY" if proba >= SIGNAL_THRESHOLD else "HOLD/SELL"
-                st.metric("Signal", signal, delta=f"P(up) {proba:.0%}")
-            else:
-                st.warning(
-                    f"Feature values contain NaN for {selected_ticker}. "
-                    "Try re-running: `python scripts/preprocessing/preprocess_data.py`"
-                )
-    else:
+@st.cache_data(ttl="15m")
+def _download_us_prices(ticker, period):
+    return normalize_yahoo(yf.download(ticker, period=period))
+
+
+@st.cache_data(ttl="1h")
+def _saved_price_slice(path, ticker):
+    return load_saved_prices(path, ticker)
+
+
+def _signal_from_row(row):
+    """Technical signal for the latest feature row. None when the model cannot score it."""
+    if row is None or "technical" not in models:
+        return None, None, None
+    missing = [name for name in TECHNICAL_FEATURES if name not in row.columns]
+    if missing:
+        return None, None, missing
+    features = row[TECHNICAL_FEATURES].dropna()
+    if features.empty:
+        return None, None, []
+    proba = float(models["technical"].predict_proba(features)[:, 1][0])
+    bar_date = format_bar_date(row["Date"].iloc[0]) if "Date" in row.columns else None
+    return position_label(proba, SIGNAL_THRESHOLD), proba, bar_date
+
+
+def _show_signal(signal, proba, bar_date, missing):
+    if "technical" not in models:
         st.info("Model not available. Please train the model first.")
+        return
+    if missing:
+        st.warning(f"Missing features: {', '.join(missing)}. Re-run preprocessing.")
+        return
+    if signal is None:
+        st.warning(
+            f"Feature values contain NaN for {selected_ticker}. "
+            "Try re-running: `python scripts/preprocessing/preprocess_data.py`"
+        )
+        return
+    tone = "green" if signal == "Long" else "gray"
+    icon = ":material/trending_up:" if signal == "Long" else ":material/account_balance_wallet:"
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.badge(signal, color=tone, icon=icon)
+        st.metric("P(up)", f"{proba:.0%}", border=True, width="content")
+    note = "Long means the model wants to be in. Cash means it does not."
+    if bar_date:
+        note = f"Bar date {bar_date}. {note}"
+    st.caption(note)
+    summary = load_technical_summary(BACKTEST_SUMMARY_PATH)
+    metrics = universe_metrics(summary)
+    if metrics:
+        with st.container(horizontal=True):
+            for item in metrics:
+                st.metric(
+                    item["label"],
+                    item["value"],
+                    delta=item["detail"],
+                    delta_color="off",
+                    delta_arrow="off",
+                    border=True,
+                )
+    won = beat_line(summary)
+    if won:
+        st.caption(won)
 
-    # --- Price Chart ---
-    st.subheader(f"{selected_ticker} Price Chart")
 
-    # Period selector
-    period_options = {
-        "1 Week": 5,
-        "1 Month": 21,
-        "3 Months": 63,
-        "6 Months": 126,
-        "1 Year": 252,
-        "All Data": None,
-    }
-    # Map to yfinance period strings for US live data
-    yf_period_map = {
-        "1 Week": "5d",
-        "1 Month": "1mo",
-        "3 Months": "3mo",
-        "6 Months": "6mo",
-        "1 Year": "1y",
-        "All Data": "5y",
-    }
-    selected_period = st.selectbox("Chart Period", list(period_options.keys()), index=2)
-    n_days = period_options[selected_period]
-
+def _price_frame(period_label):
+    """Rows for the chart, the file end date, and a caption when the series is not live."""
+    n_days = PERIOD_OPTIONS[period_label]
     if selected_country != "Kenya":
-        # US: fetch live data from yfinance for the selected period
-        yf_period = yf_period_map[selected_period]
-        chart_data = yf.download(selected_ticker, period=yf_period)
-        if not chart_data.empty:
-            if isinstance(chart_data.columns, pd.MultiIndex):
-                chart_data.columns = chart_data.columns.get_level_values(0)
-            chart_data = chart_data.reset_index()
-            chart_data["Date"] = pd.to_datetime(chart_data["Date"])
-            chart_data = chart_data.set_index("Date")
-            st.line_chart(chart_data["Close"])
-        else:
-            st.info(f"No chart data available for {selected_ticker}")
-    else:
-        # Kenya: show from the committed Kenya slice (or features.csv locally)
-        kenya_path = _feature_source("Kenya")
-        if os.path.exists(kenya_path):
-            hist = pd.read_csv(kenya_path)
-            hist = hist[hist["Ticker"] == selected_ticker].copy()
-            hist["Date"] = pd.to_datetime(hist["Date"])
-            hist = hist.sort_values("Date")
-            if n_days is not None:
-                hist = hist.tail(n_days)
-            if not hist.empty:
-                hist = hist.set_index("Date")
-                st.line_chart(hist["Close"])
+        live = _download_us_prices(selected_ticker, YF_PERIODS[period_label])
+        if not live.empty:
+            file_end, window = price_window(live, None)
+            return window, None
+        saved = _saved_price_slice(FEATURES_PATH, selected_ticker)
+        file_end, window = price_window(saved, n_days)
+        if window.empty:
+            return window, None
+        caption = None
+        if file_end:
+            caption = f"Saved file ends {file_end}. Yahoo did not return a live price."
+        return window, caption
+    saved = _saved_price_slice(_feature_source("Kenya"), selected_ticker)
+    file_end, window = price_window(saved, n_days)
+    caption = None
+    if file_end:
+        caption = f"Kenya file ends {file_end}. This chart is not a live price."
+    return window, caption
+
+
+@st.fragment
+def _price_page():
+    st.subheader(f"{selected_ticker} price")
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        period_label = st.selectbox(
+            "Chart period",
+            list(PERIOD_OPTIONS),
+            index=2,
+            key="chart_period",
+        )
+        style = st.segmented_control(
+            "Chart style",
+            ["Line", "Area"],
+            default="Line",
+            key="chart_style",
+        )
+        scale = st.segmented_control(
+            "Price scale",
+            ["Fit prices", "Include zero"],
+            default="Fit prices",
+            key="price_scale",
+        )
+    window, caption = _price_frame(period_label)
+    span = price_span(window)
+    if span:
+        change = None if span["change"] is None else f"{span['change']:+.2%}"
+        with st.container(horizontal=True):
+            st.metric("Window start", f"{span['start']:,.2f}", border=True)
+            st.metric("Latest close", f"{span['end']:,.2f}", delta=change, border=True)
+    spec = price_chart(
+        window,
+        style=style or "Line",
+        include_zero=(scale == "Include zero"),
+    )
+    if spec is None:
+        st.info(f"No chart data available for {selected_ticker}")
+        return
+    with st.container(border=True):
+        st.altair_chart(spec)
+        st.caption("Scroll to zoom. Drag to pan. Hover a date to read the close.")
+        if caption:
+            st.caption(caption)
+
+
+def _settings_page():
+    st.subheader("Model")
+    st.caption(
+        f"Technical model only. A long signal needs P(up) at or above {SIGNAL_THRESHOLD:.0%}. "
+        "Sentiment is off. This screen does not place an order."
+    )
+    st.subheader("Alerts")
+    st.caption("An alert sends the signal on the Signal tab, or nothing when that signal is missing.")
+    alert_type = st.segmented_control(
+        "Alert channel",
+        ["Email", "Discord"],
+        default="Email",
+        key="alert_channel",
+    )
+    if alert_type == "Email":
+        if st.button("Enable email alerts", key="email_alert_btn"):
+            if signal:
+                send_email_alert(signal, selected_ticker)
+                st.caption(f"Email asked to send {signal} for {selected_ticker}.")
             else:
-                st.info(f"No historical chart data for {selected_ticker}")
+                st.warning("No signal on screen, so no email was sent.")
+    elif alert_type == "Discord":
+        webhook_url = st.text_input("Discord webhook URL")
+        if st.button("Test Discord alert", key="discord_alert_btn"):
+            if signal:
+                send_discord_alert(signal, selected_ticker, webhook_url)
+                st.caption(f"Discord asked to send {signal} for {selected_ticker}.")
+            else:
+                st.warning("No signal on screen, so no Discord message was sent.")
+    st.subheader("NSE file")
+    uploaded_file = st.file_uploader("NSE Kenya CSV")
+    if uploaded_file:
+        nse_data = pd.read_csv(uploaded_file)
+        st.write("Latest NSE data:", nse_data.tail())
+    st.subheader("Feedback")
+    feedback = st.text_area("How can we improve?")
+    if st.button("Submit feedback"):
+        os.makedirs("feedback", exist_ok=True)
+        with open("feedback/log.txt", "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now()}: {feedback}\n")
+        st.toast("Thanks for your input.")
+
+
+data = fetch_latest_data(selected_ticker, selected_country)
+signal, proba, bar_or_missing = _signal_from_row(data)
+missing = bar_or_missing if isinstance(bar_or_missing, list) else None
+bar_date = None if missing is not None else bar_or_missing
+
+signal_tab, price_tab, settings_tab = st.tabs(
+    [TAB_SIGNAL, TAB_PRICE, TAB_SETTINGS],
+    default=TAB_SIGNAL,
+    on_change="rerun",
+    key="dashboard_tab",
+)
+
+if signal_tab.open is not False:
+    with signal_tab:
+        if data is None:
+            st.warning(f"No processed row for {selected_ticker}.")
         else:
-            st.info("Run preprocessing first to see Kenya charts.")
-
-# --- Upload NSE Data ---
-st.subheader("Upload NSE Kenya Data")
-uploaded_file = st.file_uploader("Upload NSE Kenya Data (CSV)")
-if uploaded_file:
-    nse_data = pd.read_csv(uploaded_file)
-    st.write("Latest NSE Data:", nse_data.tail())
-
-# --- Feedback ---
-st.subheader("Feedback")
-feedback = st.text_area("How can we improve?")
-if st.button("Submit Feedback"):
-    os.makedirs("feedback", exist_ok=True)
-    with open("feedback/log.txt", "a") as f:
-        f.write(f"{datetime.now()}: {feedback}\n")
-    st.success("Thanks for your input!")
-
-# --- Alert section ---
-st.subheader("Set Up Alerts")
-alert_type = st.radio("Alert Channel", ["Email", "Discord"], key="alert_channel")
-
-if alert_type == "Email":
-    if st.button("Enable Email Alerts", key="email_alert_btn"):
-        send_email_alert("BUY", selected_ticker)
-elif alert_type == "Discord":
-    webhook_url = st.text_input("Enter Discord Webhook URL")
-    if st.button("Test Discord Alert", key="discord_alert_btn"):
-        send_discord_alert("BUY", selected_ticker, webhook_url)
+            _show_signal(signal, proba, bar_date, missing)
+if price_tab.open is not False:
+    with price_tab:
+        _price_page()
+if settings_tab.open is not False:
+    with settings_tab:
+        _settings_page()
