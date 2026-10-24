@@ -1,0 +1,12 @@
+# Dashboard image only. Training and BERTweet stay on GitHub Actions.
+streamlit>=1.54
+pandas
+numpy
+scikit-learn
+joblib
+matplotlib
+yfinance
+requests
+beautifulsoup4
+python-dotenv
+plotly

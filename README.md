@@ -377,7 +377,7 @@ The NewsAPI chain above only reaches ~30 days on the free tier, so it cannot
 populate sentiment across the multi-year training window — which is why the
 hybrid model has been nearly identical to the technical one.
 `fetch_alpha_sentiment.py` fills that gap using Alpha Vantage's
-`NEWS_SENTIMENT` endpoint (free: 25 req/day, 5/min; history back to 2022):
+`NEWS_SENTIMENT` endpoint (free: 25 requests per day; history back to 2022). One run fetches at most 25 names. The next UTC day continues with the names still missing from `news_sentiment.csv`:
 
 - Uses the **per-ticker** sentiment score of each article, averaged per day
 - Maps Alpha Vantage's `[-1, 1]` score to the pipeline's `[0, 1]` scale
@@ -670,7 +670,7 @@ Compared with the previous AAPL-only, non-stationary-feature models (AUC ≈ 0.5
 | Win Rate | 41.0% | 39.5% | — |
 | Trades (over 990 days) | 108 | 122 | — |
 
-**Conclusion:** With the magnitude-aware label and selective `SIGNAL_THRESHOLD=0.55` trading, the **hybrid strategy now nearly matches buy-and-hold's Sharpe (0.822 vs 0.842) with less than half the drawdown (−15.3% vs −33.4%)** and trades only ~120 times over ~4 years. It trails on total return, which is expected for a long/flat strategy in a strong bull market — the trade-off is far lower risk. The backtest fits a fresh model per walk-forward fold using the **same `MODEL_PARAMS`** and thresholds that ship, so these numbers describe the deployed model. Running real sentiment (§7.5) is the main lever left.
+**Conclusion:** With the magnitude-aware label and selective `SIGNAL_THRESHOLD=0.55` trading, the **hybrid strategy now nearly matches buy-and-hold's Sharpe (0.822 vs 0.842) with less than half the drawdown (−15.3% vs −33.4%)** and trades only ~120 times over ~4 years. It trails on total return, which is expected for a long/flat strategy in a strong bull market. The trade-off is far lower risk. The backtest fits a fresh model per walk-forward fold using the **same `MODEL_PARAMS`** and thresholds that ship, so these numbers describe the deployed model. These figures are AAPL only. `scripts/backtesting/backtest.py` now reports the median across every ticker in the feature file. Running real sentiment (§7.5) is the main lever left.
 
 ### 15.3 Feature Importances (Technical Model)
 
@@ -693,9 +693,8 @@ Volume and volatility features dominate; the remaining features are fairly evenl
 |----------|----------|
 | Core | streamlit, pandas, numpy, scikit-learn, joblib, matplotlib |
 | Data Fetching | yfinance, requests, beautifulsoup4 |
-| Technical Analysis | ta |
 | Sentiment | transformers, torch |
-| ML Frameworks | tensorflow, xgboost |
+| Optional comparison | xgboost, installed only if you run compare_models.py |
 | Visualization | plotly |
 | Google Sheets | gspread |
 | Testing | pytest |
@@ -706,9 +705,9 @@ Volume and volatility features dominate; the remaining features are fairly evenl
 pip install -r requirements.txt
 ```
 
-**Note:** TensorFlow and torch are large dependencies. For a lighter install focused on core functionality:
+**Note:** torch is a large dependency used by the headline sentiment scripts. The dashboard image uses `requirements-dashboard.txt` and does not install it. For a lighter install of the board:
 ```bash
-pip install streamlit pandas numpy scikit-learn joblib yfinance ta plotly
+pip install -r requirements-dashboard.txt
 ```
 
 ---

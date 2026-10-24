@@ -7,6 +7,7 @@ against a fixture feed, so the aggregation is verified without an API key.
 import os
 import sys
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -69,3 +70,70 @@ def test_parse_feed_empty_returns_typed_empty_frame():
     df = parse_feed_to_daily([], "AAPL")
     assert df.empty
     assert list(df.columns) == ["Date", "Ticker", "sentiment_score"]
+
+
+def _article(ticker):
+    return [{
+        "time_published": "20220103T120000",
+        "ticker_sentiment": [{"ticker": ticker, "ticker_sentiment_score": "0.2"}],
+    }]
+
+
+def test_batch_stops_at_the_daily_cap_and_resumes_next_day(tmp_path):
+    from scripts.fetching.fetch_alpha_sentiment import run_sentiment_batch
+
+    output = tmp_path / "news_sentiment.csv"
+    budget = tmp_path / "alpha_vantage_budget.json"
+    calls = []
+
+    def fetch(ticker, api_key, time_from, limit):
+        calls.append(ticker)
+        return _article(ticker)
+
+    names = [f"T{i:02d}" for i in range(30)]
+    code = run_sentiment_batch(
+        names, "key", str(output), str(budget), "2026-10-17", fetch, budget=25,
+    )
+    assert code == 0
+    assert calls == names[:25]
+    saved = set(pd.read_csv(output)["Ticker"])
+    assert saved == set(names[:25])
+
+    calls.clear()
+    code = run_sentiment_batch(
+        names, "key", str(output), str(budget), "2026-10-17", fetch, budget=25,
+    )
+    assert code == 0
+    assert calls == []
+
+    code = run_sentiment_batch(
+        names, "key", str(output), str(budget), "2026-10-18", fetch, budget=25,
+    )
+    assert code == 0
+    assert calls == names[25:]
+    assert set(pd.read_csv(output)["Ticker"]) == set(names)
+
+
+def test_batch_stops_when_alpha_vantage_sends_a_note(tmp_path):
+    from scripts.fetching.fetch_alpha_sentiment import (
+        AlphaVantageLimit,
+        run_sentiment_batch,
+    )
+
+    output = tmp_path / "news_sentiment.csv"
+    budget = tmp_path / "alpha_vantage_budget.json"
+    calls = []
+
+    def fetch(ticker, api_key, time_from, limit):
+        calls.append(ticker)
+        if ticker == "MSFT":
+            raise AlphaVantageLimit("No feed for MSFT: Thank you for using Alpha Vantage")
+        return _article(ticker)
+
+    code = run_sentiment_batch(
+        ["AAPL", "MSFT", "NVDA"], "key", str(output), str(budget),
+        "2026-10-17", fetch, budget=25,
+    )
+    assert code == 0
+    assert calls == ["AAPL", "MSFT"]
+    assert list(pd.read_csv(output)["Ticker"]) == ["AAPL"]

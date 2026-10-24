@@ -1,61 +1,31 @@
 # Open Items
 
-Follow-up work after the Jul 8 2026 fix pass (commit `2f0ccd8`). Nothing here is
-broken; these are loose ends, unverified assumptions, and minor inconsistencies.
-Ordered by importance.
+Updated 2026-10-17. The code items below are done. What remains needs a key, a live site, or a long backtest run.
 
-## Needs your action / unverified against the real world
+## Done in the repo
 
-### 1. Run the sentiment fetcher against the live API (biggest lever)
-`scripts/fetching/fetch_alpha_sentiment.py` has only been unit-tested against a
-fixture — the real Alpha Vantage response shape, pagination, and rate limits are
-unexercised. Until this runs with a key, the hybrid model is identical to the
-technical one (sentiment stays neutral 0.5).
+- `origin` points at `https://github.com/TineyKode/stock-ai.git`.
+- `fetch_alpha_sentiment.py` stops at 25 calls per UTC day, writes `alpha_vantage_budget.json`, and the next day continues with tickers missing from `news_sentiment.csv`. A Note or Information response stops the run and keeps Alpha Vantage's text.
+- `retrain.yml` does not fail the weekly job when that fetch fails.
+- `compare_models.py` labels with `add_target()` and builds the forest from `MODEL_PARAMS`.
+- `backtest.py` reports the median across every ticker. The Sharpe 0.822 figure in the README is still the old AAPL run.
+- `requirements.txt` no longer installs TensorFlow, `ta`, or XGBoost. XGBoost stays optional inside `compare_models.py`.
+- The dashboard image is `Dockerfile` plus `requirements-dashboard.txt`. It does not install torch.
 
-- Get a free key at https://www.alphavantage.co/support/#api-key
-- Add `ALPHA_VANTAGE_KEY=...` to `.env`
-- Run: `python scripts/fetching/fetch_alpha_sentiment.py --time-from 20220101`
-  (free tier is ~5 req/min, so 30 tickers takes a few minutes)
-- Re-run preprocessing + retrain, then re-check the hybrid backtest.
-- Also set `ALPHA_VANTAGE_KEY` as a GitHub Actions secret so `retrain.yml` uses it.
+## Still needs a person
 
-### 2. Repoint the git remote to the renamed repo
-`origin` still points at the old `tonykihu` URL; pushes work via a 301 redirect
-but print "This repository moved."
+### 1. Run the sentiment fetcher with a real key
 
-```bash
-git remote set-url origin https://github.com/TineyKode/stock-ai.git
-```
+The parser is unit-tested against a fixture. The live Alpha Vantage payload is not. Until a keyed run writes `news_sentiment.csv` and the models are retrained, hybrid sentiment stays the neutral 0.5 fill.
 
-### 3. Verify the Streamlit Cloud deploy end-to-end
-Models are now tracked and `data/processed/kenya_features.csv` ships, so the live
-app *should* show both US (live yfinance) and Kenya (committed slice) charts and
-BUY/HOLD signals. Confirm on the deployed app — this was not verified locally.
+- Add `ALPHA_VANTAGE_KEY` to `.env` on the machine that runs the fetch. Do not commit it.
+- Run `python scripts/fetching/fetch_alpha_sentiment.py --time-from 20220101` on two UTC days so all 30 US names are covered.
+- After the file has every name, the weekly workflow can hold the same key as a GitHub secret. One Sunday then spends calls only on names that are still missing.
 
-## Caveat on the headline backtest result
+### 2. Confirm the Streamlit Cloud app
 
-### 4. Backtest is AAPL-only
-The reported hybrid Sharpe 0.822 / max drawdown -15.3% (§15.2 of the README) are
-for a single ticker. For an honest performance figure, extend
-`scripts/backtesting/backtest.py` to a portfolio / multi-ticker backtest and
-report universe-wide metrics.
+Models and `data/processed/kenya_features.csv` are in git. Confirm the deployed app shows US charts from Yahoo and the Kenya slice, with BUY/HOLD signals.
 
-## Minor inconsistencies (quick, self-contained fixes)
+### 3. Regenerate the universe backtest numbers
 
-### 5. `compare_models.py` uses the old target
-`scripts/training/compare_models.py` still labels with the old binary target
-(`Close.shift(-1) > Close`, no threshold) and its own `max_depth=10`, so its
-diagnostic RF/GB/XGB numbers won't line up with the shipped magnitude-aware
-model. Align it to `add_target()` / `TARGET_THRESHOLD` and `MODEL_PARAMS` if you
-want its output comparable. Not in CI; not broken.
-
-### 6. Prune heavy/unused dependencies
-`requirements.txt` carries `tensorflow` and `ta` (likely unused now that features
-are hand-rolled) and `xgboost` (only for the optional `compare_models.py`). CI
-installs all of them, making it slow. Audit and trim.
-
-### 7. `retrain.yml` sentiment step can fail-hard
-If `ALPHA_VANTAGE_KEY` is set but *every* ticker errors, `fetch_alpha_sentiment.py`
-exits 1 and reddens the retrain job (per-ticker failures are already caught; only a
-total wipeout returns non-zero). Consider making the CI step non-fatal, e.g.
-`run: python scripts/fetching/fetch_alpha_sentiment.py || true`.
+`python scripts/backtesting/backtest.py` fits a fresh forest per ticker. That replaces the AAPL-only headline. It needs `data/processed/features.csv` and a long run. Do not treat 0.822 as the universe result.

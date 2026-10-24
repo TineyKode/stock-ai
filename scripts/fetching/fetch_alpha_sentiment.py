@@ -9,8 +9,9 @@ The BERTweet chain (fetch_newsapi.py -> fetch_news.py) can only reach ~30 days
 of headlines on the free NewsAPI tier, so it cannot populate sentiment across
 the multi-year training window. Alpha Vantage's NEWS_SENTIMENT endpoint returns
 articles with a pre-computed sentiment score per ticker going back to 2022 and
-is free (25 requests/day, 5/min), which is enough to backfill daily sentiment
-for the pooled training set.
+is free for 25 requests per day. One call is one US ticker, and there are
+30 names, so a run stops at the cap and the next UTC day continues with the
+names that are not in the output file yet.
 
 Alpha Vantage returns an overall_sentiment_score per article in roughly
 [-1, 1] and a per-ticker ticker_sentiment_score. We use the per-ticker score
@@ -27,10 +28,12 @@ Usage
 Without a key the script prints a notice and exits 0 (the hybrid model then
 falls back to neutral 0.5), so it is safe to call from CI unconditionally.
 """
+import json
 import os
 import sys
 import time
 import argparse
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -40,8 +43,13 @@ from utils.tickers import get_tickers_by_country
 API_URL = "https://www.alphavantage.co/query"
 OUTPUT_PATH = "data/processed/news_sentiment.csv"
 
-# Free tier: 5 requests/minute. Sleep ~13s between calls to stay under it.
+# Free tier: 25 requests per day, and about 5 per minute.
+DAILY_REQUEST_BUDGET = 25
 RATE_LIMIT_SLEEP_S = 13
+
+
+class AlphaVantageLimit(RuntimeError):
+    """Alpha Vantage answered with Note or Information instead of a feed."""
 
 
 def score_to_unit(score):
@@ -121,6 +129,130 @@ def merge_into_existing(new_df, path=OUTPUT_PATH):
     return combined
 
 
+def budget_path_for(output_path):
+    folder = os.path.dirname(output_path) or "."
+    return os.path.join(folder, "alpha_vantage_budget.json")
+
+
+def covered_tickers(path):
+    """Tickers that already have at least one row in the sentiment file."""
+    if not os.path.exists(path):
+        return set()
+    existing = pd.read_csv(path)
+    if existing.empty or "Ticker" not in existing.columns:
+        return set()
+    return set(existing["Ticker"].astype(str))
+
+
+def load_used(path, today):
+    """Calls already spent on this UTC date. A new date starts at zero."""
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if data.get("date") != today:
+        return 0
+    try:
+        return max(0, int(data.get("used", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def save_used(path, today, used):
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"date": today, "used": int(used)}, handle)
+
+
+def choose_tickers(all_tickers, covered, used, budget=DAILY_REQUEST_BUDGET):
+    """Names still missing, capped by the calls left today."""
+    pending = [ticker for ticker in all_tickers if ticker not in covered]
+    remaining = max(0, budget - used)
+    return pending[:remaining]
+
+
+def run_sentiment_batch(
+    tickers,
+    api_key,
+    output_path,
+    budget_path,
+    today,
+    fetch_fn,
+    sleep_fn=None,
+    time_from=None,
+    limit=1000,
+    budget=DAILY_REQUEST_BUDGET,
+):
+    """
+    Fetch at most the calls left in today's budget.
+
+    Tickers already present in the output file are skipped, so the next day
+    continues at the first missing name instead of starting over at AAPL.
+    A Note or Information response stops the run and keeps the original text.
+    Returns the process exit code.
+    """
+    covered = covered_tickers(output_path)
+    used = load_used(budget_path, today)
+    chosen = choose_tickers(tickers, covered, used, budget)
+    if not chosen:
+        print(f"No Alpha Vantage calls today. Used {used} of {budget}. "
+              f"{len(covered)} tickers already saved.")
+        return 0
+
+    print(f"Fetching {len(chosen)} of {len(tickers)} tickers "
+          f"({used} of {budget} calls already used today).")
+    frames = []
+    saw_limit = False
+    saw_error = False
+    for index, ticker in enumerate(chosen):
+        if index and sleep_fn:
+            sleep_fn()
+        try:
+            feed = fetch_fn(ticker, api_key, time_from, limit)
+            daily = parse_feed_to_daily(feed, ticker)
+            if not daily.empty:
+                frames.append(daily)
+            print(f"  {ticker}: {len(daily)} days")
+        except AlphaVantageLimit as exc:
+            used += 1
+            save_used(budget_path, today, used)
+            saw_limit = True
+            print(f"  {ticker}: stopped ({exc})")
+            break
+        except Exception as exc:  # noqa: BLE001 - keep the vendor message, try the next name
+            used += 1
+            save_used(budget_path, today, used)
+            saw_error = True
+            print(f"  {ticker}: FAILED ({exc})")
+            continue
+        used += 1
+        save_used(budget_path, today, used)
+
+    if not frames:
+        if saw_limit:
+            print("Alpha Vantage returned no feed. Saved calls stop here.")
+            return 0
+        if saw_error:
+            print("No sentiment fetched.")
+            return 1
+        print("Alpha Vantage returned no usable articles.")
+        return 0
+
+    new_df = pd.concat(frames, ignore_index=True)
+    combined = merge_into_existing(new_df, output_path)
+    folder = os.path.dirname(output_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    combined.to_csv(output_path, index=False)
+    print(f"Wrote {len(combined)} rows to {output_path}")
+    return 0
+
+
 def fetch_ticker(ticker, api_key, time_from=None, limit=1000):
     """Call the Alpha Vantage NEWS_SENTIMENT endpoint for one ticker."""
     import requests  # lazy: keep the module importable without requests
@@ -139,11 +271,14 @@ def fetch_ticker(ticker, api_key, time_from=None, limit=1000):
     resp.raise_for_status()
     payload = resp.json()
 
-    # Alpha Vantage signals throttling/errors with a "Note" or "Information"
-    # field and a 200 status; surface it instead of silently writing nothing.
+    # Alpha Vantage signals throttling and errors with a Note or Information
+    # field and a 200 status. Keep that text. Stop the day's run on it.
     if "feed" not in payload:
         note = payload.get("Note") or payload.get("Information") or payload
-        raise RuntimeError(f"No feed for {ticker}: {note}")
+        message = f"No feed for {ticker}: {note}"
+        if "Note" in payload or "Information" in payload:
+            raise AlphaVantageLimit(message)
+        raise RuntimeError(message)
     return payload["feed"]
 
 
@@ -169,31 +304,18 @@ def main():
         return 0
 
     tickers = get_tickers_by_country("US")
-    print(f"Fetching Alpha Vantage sentiment for {len(tickers)} tickers "
-          f"(free tier: ~5/min, this will take a few minutes)...")
-
-    daily_frames = []
-    for i, ticker in enumerate(tickers):
-        try:
-            feed = fetch_ticker(ticker, api_key, args.time_from, args.limit)
-            daily = parse_feed_to_daily(feed, ticker)
-            daily_frames.append(daily)
-            print(f"  [{i+1}/{len(tickers)}] {ticker}: {len(daily)} days")
-        except Exception as exc:  # noqa: BLE001 - keep going, report per ticker
-            print(f"  [{i+1}/{len(tickers)}] {ticker}: FAILED ({exc})")
-        if i < len(tickers) - 1:
-            time.sleep(RATE_LIMIT_SLEEP_S)
-
-    if not daily_frames:
-        print("No sentiment fetched.")
-        return 1
-
-    new_df = pd.concat(daily_frames, ignore_index=True)
-    combined = merge_into_existing(new_df, args.output)
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    combined.to_csv(args.output, index=False)
-    print(f"Wrote {len(combined)} rows to {args.output}")
-    return 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    return run_sentiment_batch(
+        tickers,
+        api_key,
+        args.output,
+        budget_path_for(args.output),
+        today,
+        fetch_ticker,
+        sleep_fn=lambda: time.sleep(RATE_LIMIT_SLEEP_S),
+        time_from=args.time_from,
+        limit=args.limit,
+    )
 
 
 if __name__ == "__main__":

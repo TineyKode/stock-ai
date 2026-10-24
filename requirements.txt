@@ -12,18 +12,9 @@ requests
 beautifulsoup4
 python-dotenv
 
-# Technical analysis
-ta
-
-# Sentiment analysis
+# Sentiment analysis. Weekly retrain still uses these. The dashboard image does not.
 transformers
 torch
-
-# ML framework
-tensorflow
-
-# Model comparison
-xgboost
 
 # Dashboard charts
 plotly

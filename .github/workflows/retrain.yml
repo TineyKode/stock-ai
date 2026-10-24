@@ -30,7 +30,7 @@ jobs:
       - name: Fetch historical sentiment (optional)
         env:
           ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
-        run: python scripts/fetching/fetch_alpha_sentiment.py
+        run: python scripts/fetching/fetch_alpha_sentiment.py || true
 
       - name: Retrain models
         run: python scripts/training/retrain_models.py

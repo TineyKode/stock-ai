@@ -7,11 +7,11 @@ computes Sharpe ratio, max drawdown, win rate, and compares to buy-and-hold.
 Usage:
   python scripts/backtesting/backtest.py
 """
+import json
 import os
 import sys
 import numpy as np
 import pandas as pd
-import joblib
 from sklearn.model_selection import TimeSeriesSplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -156,6 +156,60 @@ def backtest_model(model, X, close_prices, feature_names, n_splits=5,
     return metrics, results_df
 
 
+def backtest_frame(df, model, feature_names, n_splits=5):
+    """Run the walk-forward backtest once per ticker. Skip a name with no folds."""
+    rows = []
+    if "Ticker" not in df.columns:
+        df = df.copy()
+        df["Ticker"] = "AAPL"
+    for ticker, group in df.groupby("Ticker", sort=True):
+        group = group.sort_values("Date")
+        columns = [name for name in feature_names if name in group.columns]
+        features = group[columns]
+        close = group["Close"]
+        valid = features.dropna().index
+        features = features.loc[valid]
+        close = close.loc[valid]
+        metrics, _daily = backtest_model(model, features, close, columns, n_splits=n_splits)
+        if not metrics:
+            continue
+        metrics = dict(metrics)
+        metrics["ticker"] = ticker
+        rows.append(metrics)
+    return rows
+
+
+def summarize_universe(per_ticker):
+    """Median result across tickers. The old headline number was AAPL alone."""
+    if not per_ticker:
+        return {}
+    frame = pd.DataFrame(per_ticker)
+    return {
+        "n_tickers": int(len(frame)),
+        "median_sharpe": float(frame["sharpe_ratio"].median()),
+        "median_sharpe_buyhold": float(frame["sharpe_ratio_buyhold"].median()),
+        "median_total_return": float(frame["total_return_strategy"].median()),
+        "median_total_return_buyhold": float(frame["total_return_buyhold"].median()),
+        "median_max_drawdown": float(frame["max_drawdown"].median()),
+        "median_max_drawdown_buyhold": float(frame["max_drawdown_buyhold"].median()),
+        "beat_buyhold": int((frame["sharpe_ratio"] > frame["sharpe_ratio_buyhold"]).sum()),
+    }
+
+
+def print_universe_report(summary, label="Model"):
+    if not summary:
+        print(f"\n{label}: no tickers produced a backtest.")
+        return
+    print(f"\n{label}: {summary['n_tickers']} tickers")
+    print(f"  Median Sharpe:       {summary['median_sharpe']:.3f}  "
+          f"(buy and hold {summary['median_sharpe_buyhold']:.3f})")
+    print(f"  Median return:       {summary['median_total_return']:.2%}  "
+          f"(buy and hold {summary['median_total_return_buyhold']:.2%})")
+    print(f"  Median max drawdown: {summary['median_max_drawdown']:.2%}  "
+          f"(buy and hold {summary['median_max_drawdown_buyhold']:.2%})")
+    print(f"  Beat buy and hold:   {summary['beat_buyhold']} of {summary['n_tickers']}")
+
+
 def print_backtest_report(metrics, label="Model"):
     """Print formatted backtest results."""
     if not metrics:
@@ -184,7 +238,7 @@ def print_backtest_report(metrics, label="Model"):
 
 
 def main():
-    """Run backtest on technical and hybrid models for AAPL."""
+    """Run the technical and hybrid backtests for every ticker in the feature file."""
     features_path = "data/processed/features.csv"
     if not os.path.exists(features_path):
         print(f"Features file not found: {features_path}")
@@ -192,49 +246,36 @@ def main():
         return
 
     df = pd.read_csv(features_path)
+    names = sorted(df["Ticker"].unique()) if "Ticker" in df.columns else ["AAPL"]
+    print(f"Backtesting {len(names)} tickers, {len(df)} rows")
 
-    # Filter to AAPL (most data)
-    ticker = "AAPL"
-    if "Ticker" in df.columns:
-        df = df[df["Ticker"] == ticker].copy()
-    df = df.sort_values("Date").reset_index(drop=True)
+    from sklearn.ensemble import RandomForestClassifier
 
-    print(f"Backtesting on {ticker}: {len(df)} rows")
-
-    # --- Technical Model ---
-    tech_model_path = "models/technical_model.pkl"
-    if os.path.exists(tech_model_path):
-        tech_model = joblib.load(tech_model_path)
-        feat_cols = [f for f in TECHNICAL_FEATURES if f in df.columns]
-        X = df[feat_cols].copy()
-        close = df["Close"].copy()
-
-        # Drop rows with NaN features
-        valid = X.dropna().index
-        X = X.loc[valid]
-        close = close.loc[valid]
-
-        from sklearn.ensemble import RandomForestClassifier
-        # Fresh model per fold, using the SAME hyperparameters that ship
-        # (utils.features.MODEL_PARAMS) so the backtest reflects the
-        # deployed model rather than an ad-hoc configuration.
-        metrics, results = backtest_model(
+    tech_rows = []
+    if os.path.exists("models/technical_model.pkl"):
+        feat_cols = [name for name in TECHNICAL_FEATURES if name in df.columns]
+        tech_rows = backtest_frame(
+            df,
             RandomForestClassifier(**MODEL_PARAMS["technical"]),
-            X, close, feat_cols,
+            feat_cols,
         )
-        print_backtest_report(metrics, f"Technical Model ({ticker})")
+        print_universe_report(summarize_universe(tech_rows), "Technical model")
     else:
-        print(f"\nTechnical model not found at {tech_model_path}, skipping.")
+        print("\nTechnical model not found at models/technical_model.pkl, skipping.")
 
-    # --- Hybrid Model ---
     sentiment_path = "data/processed/news_sentiment.csv"
     if os.path.exists(sentiment_path):
         sentiment = pd.read_csv(sentiment_path)
         merge_cols = ["Date"]
         if "Ticker" in sentiment.columns:
             merge_cols.append("Ticker")
-        df_hybrid = pd.merge(df, sentiment[merge_cols + ["sentiment_score"]],
-                             on=merge_cols, how="left", suffixes=("", "_sent"))
+        df_hybrid = pd.merge(
+            df,
+            sentiment[merge_cols + ["sentiment_score"]],
+            on=merge_cols,
+            how="left",
+            suffixes=("", "_sent"),
+        )
         if "sentiment_score_sent" in df_hybrid.columns:
             df_hybrid["sentiment_score"] = df_hybrid["sentiment_score_sent"]
             df_hybrid.drop(columns=["sentiment_score_sent"], inplace=True)
@@ -246,31 +287,24 @@ def main():
     else:
         df_hybrid["sentiment_score"] = df_hybrid["sentiment_score"].fillna(0.5)
 
-    feat_cols_h = [f for f in HYBRID_FEATURES if f in df_hybrid.columns]
-    X_h = df_hybrid[feat_cols_h].copy()
-    close_h = df_hybrid["Close"].copy()
-
-    valid_h = X_h.dropna().index
-    X_h = X_h.loc[valid_h]
-    close_h = close_h.loc[valid_h]
-
-    from sklearn.ensemble import RandomForestClassifier
-    metrics_h, results_h = backtest_model(
+    feat_cols_h = [name for name in HYBRID_FEATURES if name in df_hybrid.columns]
+    hybrid_rows = backtest_frame(
+        df_hybrid,
         RandomForestClassifier(**MODEL_PARAMS["hybrid"]),
-        X_h, close_h, feat_cols_h,
+        feat_cols_h,
     )
-    print_backtest_report(metrics_h, f"Hybrid Model ({ticker})")
+    print_universe_report(summarize_universe(hybrid_rows), "Hybrid model")
 
-    # Save results
     os.makedirs("logs", exist_ok=True)
-    try:
-        if not results.empty:
-            results.to_csv("logs/backtest_technical.csv", index=False)
-    except NameError:
-        pass
-    if not results_h.empty:
-        results_h.to_csv("logs/backtest_hybrid.csv", index=False)
-    print("\nDetailed results saved to logs/")
+    payload = {
+        "technical": tech_rows,
+        "hybrid": hybrid_rows,
+        "technical_summary": summarize_universe(tech_rows),
+        "hybrid_summary": summarize_universe(hybrid_rows),
+    }
+    with open("logs/backtest_universe.json", "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    print("\nPer-ticker results saved to logs/backtest_universe.json")
 
 
 if __name__ == "__main__":

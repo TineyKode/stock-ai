@@ -17,15 +17,29 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.features import TECHNICAL_FEATURES
+from utils.dataset import add_target
+from utils.features import MODEL_PARAMS, TECHNICAL_FEATURES
+
+
+def prepare_comparison(df, ticker="AAPL"):
+    """Label one ticker with the same magnitude-aware target the shipped model uses."""
+    frame = df.copy()
+    if "Ticker" in frame.columns:
+        frame = frame[frame["Ticker"] == ticker].copy()
+    else:
+        frame["Ticker"] = ticker
+    labeled = add_target(frame)
+    feat_cols = [name for name in TECHNICAL_FEATURES if name in labeled.columns]
+    labeled = labeled.dropna(subset=feat_cols + ["Target"])
+    x = labeled[feat_cols]
+    y = labeled["Target"].astype(int)
+    return x, y
 
 
 def get_models():
-    """Return dict of model_name → model instance."""
+    """Return dict of model_name to model instance."""
     models = {
-        "RandomForest": RandomForestClassifier(
-            n_estimators=200, max_depth=10, random_state=42
-        ),
+        "RandomForest": RandomForestClassifier(**MODEL_PARAMS["technical"]),
         "GradientBoosting": GradientBoostingClassifier(
             n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42
         ),
@@ -38,7 +52,7 @@ def get_models():
             random_state=42, use_label_encoder=False, eval_metric="logloss",
         )
     except ImportError:
-        print("XGBoost not installed — skipping. Install with: pip install xgboost")
+        print("XGBoost not installed, skipping. Install with: pip install xgboost")
 
     return models
 
@@ -89,24 +103,9 @@ def main():
         return
 
     df = pd.read_csv(features_path)
-
-    # Filter to AAPL
     ticker = "AAPL"
-    if "Ticker" in df.columns:
-        df = df[df["Ticker"] == ticker].copy()
-    df = df.sort_values("Date").reset_index(drop=True)
-
-    # Prepare features and target
-    feat_cols = [f for f in TECHNICAL_FEATURES if f in df.columns]
-    X = df[feat_cols].copy()
-    y = (df["Close"].shift(-1) > df["Close"]).astype(int)
-
-    # Drop last row (no target) and NaN rows
-    X = X.iloc[:-1]
-    y = y.iloc[:-1]
-    valid = X.dropna().index
-    X = X.loc[valid]
-    y = y.loc[valid]
+    X, y = prepare_comparison(df, ticker)
+    feat_cols = list(X.columns)
 
     print(f"Comparing models on {ticker}: {len(X)} samples, {len(feat_cols)} features")
     print(f"Target distribution: {y.mean():.1%} up days\n")
